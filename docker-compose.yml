@@ -1,0 +1,133 @@
+# Tier 1 — browse catalog + check stock (no login required)
+#
+# Starts: postgres, redis, ecom-service, inventory-service
+# Skips:  kafka, keycloak (env vars point to these service names so Tier 2
+#         can add them to this file and everything wires up automatically)
+#
+# Usage:
+#   docker compose up --build        # first run (builds images)
+#   docker compose up                # subsequent runs (uses cached images)
+#   docker compose down              # stop, keep DB data
+#   docker compose down -v           # stop + wipe DB data
+#
+# NOTE: ecom-service build downloads the OpenTelemetry Java agent (~100 MB)
+# from GitHub on first build. Internet access is required.
+#
+# Endpoints once healthy:
+#   ecom-service:       http://localhost:8080/ecom/books
+#   ecom-service docs:  http://localhost:8080/ecom/swagger-ui.html
+#   inventory-service:  http://localhost:8000/inven/stock/bulk?book_ids=00000000-0000-0000-0000-000000000001
+#   inventory-service:  http://localhost:8000/inven/docs
+
+services:
+
+  # ── Infrastructure ────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Migrations ────────────────────────────────────────────────────────────
+
+  inventory-migrate:
+    build:
+      context: ./inventory-service
+    # Mirrors the K8s init container command exactly.
+    # Uses psycopg2 (synchronous) URL — alembic's engine_from_config is blocking.
+    command: ["python3", "-m", "alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: postgresql://inventory:inventory@postgres:5432/inventory_db
+      # Required by pydantic Settings validation at import time — not called during migration.
+      KEYCLOAK_JWKS_URI: http://keycloak:8080/realms/bookstore/protocol/openid-connect/certs
+      KEYCLOAK_ISSUER_URI: http://keycloak:8080/realms/bookstore
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ── Application services ──────────────────────────────────────────────────
+
+  ecom-service:
+    build:
+      context: ./ecom-service
+    ports:
+      - "8080:8080"
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/ecom_db
+      DB_USERNAME: ecom
+      DB_PASSWORD: ecom
+      # Liquibase migrations run automatically on startup (no separate step needed).
+      # Keycloak: JWKS is fetched lazily — only on first JWT validation.
+      # Public endpoints (GET /books, /books/search, /books/{id}) never trigger it.
+      KEYCLOAK_JWKS_URI: http://keycloak:8080/realms/bookstore/protocol/openid-connect/certs
+      # Kafka: producer connects lazily on first send() — only called at checkout.
+      # Consumer retries silently in the background without crashing the service.
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ""
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # eclipse-temurin:21-jre-alpine has busybox wget.
+      # Checks the public /books endpoint — avoids the Kafka health indicator
+      # (which returns 503 when Kafka is not running) confusing the check.
+      test: ["CMD-SHELL", "wget -q --tries=1 -O /dev/null http://localhost:8080/ecom/books"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 60s
+
+  inventory-service:
+    build:
+      context: ./inventory-service
+    ports:
+      - "8000:8000"
+    environment:
+      # asyncpg URL for the async SQLAlchemy engine used by the app.
+      DATABASE_URL: postgresql+asyncpg://inventory:inventory@postgres:5432/inventory_db
+      # Keycloak: JWKS fetched lazily — public stock endpoints never trigger it.
+      KEYCLOAK_JWKS_URI: http://keycloak:8080/realms/bookstore/protocol/openid-connect/certs
+      KEYCLOAK_ISSUER_URI: http://keycloak:8080/realms/bookstore
+      # Kafka: supervised consumer retries in background — HTTP endpoints unaffected.
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      postgres:
+        condition: service_healthy
+      inventory-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  postgres-data:
