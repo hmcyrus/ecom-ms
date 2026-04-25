@@ -1,8 +1,5 @@
-# Tier 1 — browse catalog + check stock (no login required)
-#
-# Starts: postgres, redis, ecom-service, inventory-service
-# Skips:  kafka, keycloak (env vars point to these service names so Tier 2
-#         can add them to this file and everything wires up automatically)
+# Starts: postgres, redis, ecom-service, inventory-service, keycloak, ui
+# Skips:  kafka (only needed for checkout end-to-end; everything else works without it)
 #
 # Usage:
 #   docker compose up --build        # first run (builds images)
@@ -14,10 +11,10 @@
 # from GitHub on first build. Internet access is required.
 #
 # Endpoints once healthy:
-#   ecom-service:       http://localhost:8080/ecom/books
+#   UI:                 http://localhost:3000          (login: user1 / CHANGE_ME)
 #   ecom-service docs:  http://localhost:8080/ecom/swagger-ui.html
-#   inventory-service:  http://localhost:8000/inven/stock/bulk?book_ids=00000000-0000-0000-0000-000000000001
-#   inventory-service:  http://localhost:8000/inven/docs
+#   inventory docs:     http://localhost:8000/inven/docs
+#   Keycloak admin:     http://localhost:8180/admin    (admin / admin)
 
 services:
 
@@ -131,6 +128,72 @@ services:
       timeout: 5s
       retries: 5
       start_period: 15s
+
+  # ── Identity ─────────────────────────────────────────────────────────────
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.5.4
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports:
+      - "8180:8080"
+    volumes:
+      - ./infra/keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+    healthcheck:
+      # Check the realm endpoint — confirms both startup and realm import are done.
+      # Keycloak image (Red Hat UBI) has curl available.
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/realms/bookstore > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  keycloak-setup:
+    # Patches ui-client in the imported realm to accept http://localhost:3000 redirects.
+    # Realm export only contains production URIs (https://myecom.net:30000 etc.).
+    # Uses python:3.12-slim — already pulled for inventory-service, no extra image pull.
+    image: python:3.12-slim
+    command: ["python3", "/setup/keycloak-setup.py"]
+    volumes:
+      - ./docker/keycloak-setup.py:/setup/keycloak-setup.py:ro
+    depends_on:
+      keycloak:
+        condition: service_healthy
+    restart: "no"
+
+  # ── Frontend ──────────────────────────────────────────────────────────────
+
+  ui:
+    build:
+      context: ./ui
+      args:
+        # VITE_ vars are baked into the JS bundle at build time (not runtime).
+        # Authority points to Keycloak on the host — the browser calls it directly
+        # for OIDC auth; only API calls go through the nginx proxy.
+        VITE_KEYCLOAK_AUTHORITY: http://localhost:8180/realms/bookstore
+        VITE_KEYCLOAK_CLIENT_ID: ui-client
+        VITE_REDIRECT_URI: http://localhost:3000/callback
+    ports:
+      - "3000:80"
+    volumes:
+      # Override the production nginx config (which has K8s DNS names) with one
+      # that proxies /ecom/ and /inven/ to Docker Compose service names.
+      - ./docker/nginx.dev.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      keycloak-setup:
+        condition: service_completed_successfully
+      ecom-service:
+        condition: service_healthy
+      inventory-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --tries=1 -O /dev/null http://localhost:80/nginx-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
 
 volumes:
   postgres-data:
