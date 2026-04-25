@@ -57,7 +57,7 @@ services:
       DATABASE_URL: postgresql://inventory:inventory@postgres:5432/inventory_db
       # Required by pydantic Settings validation at import time — not called during migration.
       KEYCLOAK_JWKS_URI: http://keycloak:8080/realms/bookstore/protocol/openid-connect/certs
-      KEYCLOAK_ISSUER_URI: http://keycloak:8080/realms/bookstore
+      KEYCLOAK_ISSUER_URI: http://localhost:8180/realms/bookstore
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     depends_on:
       postgres:
@@ -79,7 +79,7 @@ services:
       # Keycloak: JWKS is fetched lazily — only on first JWT validation.
       # Public endpoints (GET /books, /books/search, /books/{id}) never trigger it.
       KEYCLOAK_JWKS_URI: http://keycloak:8080/realms/bookstore/protocol/openid-connect/certs
-      KEYCLOAK_ISSUER_URI: http://keycloak:8080/realms/bookstore
+      KEYCLOAK_ISSUER_URI: http://localhost:8180/realms/bookstore
       # inventory-service base URL — client appends /inven/stock/reserve at checkout.
       INVENTORY_SERVICE_URL: http://inventory-service:8000
       # Kafka: producer connects lazily on first send() — only called at checkout.
@@ -113,7 +113,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://inventory:inventory@postgres:5432/inventory_db
       # Keycloak: JWKS fetched lazily — public stock endpoints never trigger it.
       KEYCLOAK_JWKS_URI: http://keycloak:8080/realms/bookstore/protocol/openid-connect/certs
-      KEYCLOAK_ISSUER_URI: http://keycloak:8080/realms/bookstore
+      KEYCLOAK_ISSUER_URI: http://localhost:8180/realms/bookstore
       # Kafka: supervised consumer retries in background — HTTP endpoints unaffected.
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     depends_on:
@@ -133,21 +133,26 @@ services:
 
   keycloak:
     image: quay.io/keycloak/keycloak:26.5.4
-    command: ["start-dev", "--import-realm"]
+    entrypoint: ["/bin/sh", "/startup/keycloak-start.sh"]
     environment:
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: admin
+      # Pin the issuer URL to what the browser sees — tokens will carry this as `iss`.
+      # Services must set KEYCLOAK_ISSUER_URI to this same value for JWT validation.
+      KC_HOSTNAME_URL: http://localhost:8180
+      KC_HOSTNAME_STRICT: "false"
     ports:
       - "8180:8080"
     volumes:
       - ./infra/keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+      - ./docker/keycloak-start.sh:/startup/keycloak-start.sh:ro
     healthcheck:
-      # Check the realm endpoint — confirms both startup and realm import are done.
-      # Keycloak image (Red Hat UBI) has curl available.
-      test: ["CMD-SHELL", "curl -sf http://localhost:8080/realms/bookstore > /dev/null"]
+      # Sentinel file written by keycloak-start.sh after sslRequired patches are applied.
+      # Also verifies the realm endpoint is live before marking healthy.
+      test: ["CMD-SHELL", "test -f /tmp/keycloak-ready && curl -sf http://localhost:8080/realms/bookstore > /dev/null"]
       interval: 10s
       timeout: 5s
-      retries: 20
+      retries: 30
       start_period: 30s
 
   keycloak-setup:
