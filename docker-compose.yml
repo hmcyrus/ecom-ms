@@ -82,6 +82,7 @@ services:
       # Keycloak: JWKS is fetched lazily — only on first JWT validation.
       # Public endpoints (GET /books, /books/search, /books/{id}) never trigger it.
       KEYCLOAK_JWKS_URI: http://keycloak:8080/realms/bookstore/protocol/openid-connect/certs
+      KEYCLOAK_ISSUER_URI: http://keycloak:8080/realms/bookstore
       # Kafka: producer connects lazily on first send() — only called at checkout.
       # Consumer retries silently in the background without crashing the service.
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
