@@ -83,6 +83,8 @@ services:
       # Public endpoints (GET /books, /books/search, /books/{id}) never trigger it.
       KEYCLOAK_JWKS_URI: http://keycloak:8080/realms/bookstore/protocol/openid-connect/certs
       KEYCLOAK_ISSUER_URI: http://keycloak:8080/realms/bookstore
+      # inventory-service base URL — client appends /inven/stock/reserve at checkout.
+      INVENTORY_SERVICE_URL: http://inventory-service:8000
       # Kafka: producer connects lazily on first send() — only called at checkout.
       # Consumer retries silently in the background without crashing the service.
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
